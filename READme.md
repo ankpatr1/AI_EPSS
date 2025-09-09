@@ -131,4 +131,9 @@ Channels
 Email/Slack at 9 AM local (“Daily EPSS CVE Report”)
 Optionally, dashboard embed
 
+CLI:
+--------------------------
+-> python3 report.py
+->python report.py api --cve CVE-2025-12345 --date 2025-07-08 --db modify1.json
+-> python modifiedfilereport.py api --cve CVE-2025-12345 --date 2025-07-08 --db modify1.json
 
