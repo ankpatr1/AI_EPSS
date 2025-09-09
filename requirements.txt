@@ -1,0 +1,4 @@
+```text
+requests
+beautifulsoup4
+lxml

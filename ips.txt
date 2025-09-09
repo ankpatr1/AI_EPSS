@@ -1,0 +1,22 @@
+# ips.txt: one IP per line
+cat ips.txt \
+| xargs -P3 -n1 sh -c '
+  curl -s -H "Accept: application/json" -H "X-Api-Key: $CROWDSEC_CTI_API_KEY" \
+       "https://cti.api.crowdsec.net/v2/smoke/$1"
+' _ \
+| jq -s -r '
+  ["ip","reputation","confidence","as_num","as_name","country","classifications"],
+  ( .[]
+    | (.classifications.classifications // []) as $cls
+    | select((.reputation=="malicious") or (.reputation=="suspicious"))
+    | select($cls | map(.name) | index("profile:web_hosting"))
+    | [ .ip,
+        .reputation,
+        (.confidence // ""),
+        (.as_num // ""),
+        (.as_name // ""),
+        (.location.country // ""),
+        ($cls | map(.name) | join(";"))
+      ]
+  ) | @csv
+' > crowdsec_web_hosting.csv

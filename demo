@@ -1,0 +1,8 @@
+this format i need : 
+
+def( cveid: str , report : str)   -> dict
+{
+    date:"...";
+    id:"..";
+    ....;
+}

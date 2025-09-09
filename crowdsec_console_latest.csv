@@ -1,0 +1,11 @@
+ip,reputation,seen_ago,hostname,country,asn,classifications,behaviors
+50.87.222.88,Malicious,2 minutes ago,19.0,AS,,4,2
+20.46.50.43,Malicious,17 minutes ago,46.50.43,AS,,3,3
+65.254.81.60,Malicious,17 minutes ago,254.81.60,,,6,4
+103.219.251.21,Malicious,17 minutes ago,219.251.21,,,6,4
+198.54.114.111,Malicious,17 minutes ago,54.114.111,NET,,4,1
+198.57.247.147,Malicious,17 minutes ago,57.247.147,AS,,5,1
+50.87.144.31,Malicious,17 minutes ago,87.144.31,AS,,6,4
+132.148.177.88,Malicious,17 minutes ago,148.177.88,LLC,,5,1
+162.241.216.56,Malicious,17 minutes ago,241.216.56,AS,,4,1
+67.20.116.151,Malicious,17 minutes ago,20.116.151,AS,,5,3

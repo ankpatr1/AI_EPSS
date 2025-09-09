@@ -1,0 +1,19 @@
+{'author': 'Giorgi Dograshvili [DRAGOWN]',
+ 'cve': ['CVE-2025-26264'],
+ 'id': None,
+ 'platform': None,
+ 'poc': 'https://github.com/DRAGOWN/CVE-2025-26264',
+ 'port': None,
+ 'published_date': '19-MAR-2025',
+ 'published_date_iso': '2025-03-19',
+ 'software_link': 'https://www.geovision.com.tw/download/product/',
+ 'source': 'Exploit-DB',
+ 'tested_on': ['Windows 10', 'Kali Linux'],
+ 'title': 'GeoVision ASManager Windows Application 6.1.2.0 - Remote Code '
+          'Execution (RCE)',
+ 'type': None,
+ 'url': '',
+ 'vendor_homepage': 'https://www.geovision.com.tw/',
+ 'verified': None,
+ 'version': '6.1.2.0 or less'
+}
