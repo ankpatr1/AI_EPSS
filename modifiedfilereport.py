@@ -1,8 +1,24 @@
-# report.py
+# modifiedreport.py
 import requests
 from bs4 import BeautifulSoup
 import json, re, csv, time, datetime as dt
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+
+# ---------------------- Config ----------------------
+DEFAULT_DB_PATH = "modify1.json"   # local DB JSON (optional, used first)
+DEFAULT_CVE_LIST = "cves.txt"      # lines: CVE-YYYY-NNNN[,YYYY-MM-DD]
+DELAY   = 0.5                      # polite delay between live fetches
+TIMEOUT = 25
+
+# Minimum number of CVE-backed records to print when running with no args
+MIN_DEFAULT_RESULTS = 30
+
+# If cves.txt missing, we’ll use this fallback list:
+CVE_FALLBACK_LINES = [
+    "CVE-2025-26264",
+    "CVE-2025-12345,2025-07-08",
+    "CVE-2024-9999",
+]
 
 # ---------------------- HTTP session ----------------------
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/605.1.15 "
@@ -12,13 +28,13 @@ SESSION.headers.update({
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
-TIMEOUT = 25
-DELAY   = 0.5  # be polite
 
 # ---------------------- Endpoints ------------------------
 EDB_HOME         = "https://www.exploit-db.com/"
 EDB_DETAIL_FMT   = "https://www.exploit-db.com/exploits/{id}"
 EDB_RAW_FMT      = "https://www.exploit-db.com/raw/{id}"
+EDB_SEARCH_Q     = "https://www.exploit-db.com/search?q={q}"
+EDB_SEARCH_CVE   = "https://www.exploit-db.com/search?cve={cve}"
 CSV_URL          = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/files_exploits.csv"
 RAW_BASE_GITLAB  = "https://gitlab.com/exploit-database/exploitdb/-/raw/main/"
 
@@ -34,9 +50,8 @@ HDR = {
     "cve"             : re.compile(r"^\s*#\s*(CVE(?:\s*IDs?)?|CVE\s*ID)\s*:?\s*(.+)$", re.I),
     "poc"             : re.compile(r"^\s*#\s*(PoC|POC)\s*:?\s*(.+)$", re.I),
 }
-CVE_TOKEN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
-URL_TOKEN = re.compile(r"https?://[^\s\)\]]+")
-
+CVE_TOKEN  = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.I)
+URL_TOKEN  = re.compile(r"https?://[^\s\)\]]+")
 SECTION_HEADINGS = {
     "requirements": re.compile(r"^\s*requirements\s*$", re.I),
     "impact": re.compile(r"^\s*impact\s*$", re.I),
@@ -57,7 +72,7 @@ def http_get_text(url: str) -> Optional[str]:
 def parse_date_to_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
     s = s.strip()
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)   # YYYY-MM-DD prefix if present
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})", s)
     if m: return m.group(1)
     for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%b %d, %Y", "%B %d, %Y",
                 "%d/%m/%Y", "%Y/%m/%d", "%d.%m.%Y"):
@@ -108,7 +123,7 @@ def latest_ids_from_csv(n: int) -> List[int]:
     if not idx: return []
     return sorted(idx.keys(), reverse=True)[:max(1, n)]
 
-# ---------------------- Parsers (raw) --------------------
+# ---------------------- Parsers (raw/html) --------------------
 def parse_raw_headers(text: str) -> dict:
     out = {
         "Exploit Title": None, "_title_label": None,
@@ -137,9 +152,7 @@ def parse_raw_headers(text: str) -> dict:
             matched = True
         for key in ["vendor_homepage","software_link","version","tested_on","cve","poc"]:
             if matched: break
-            m = HDR.get(key, None)
-            if not m: continue
-            mm = m.match(line)
+            mm = HDR.get(key, None).match(line) if HDR.get(key) else None
             if not mm: continue
             val = (mm.group(2) or "").strip()
             if key == "vendor_homepage": out["vendor_homepage"] = val
@@ -151,11 +164,9 @@ def parse_raw_headers(text: str) -> dict:
                 out["cve_list"] = sorted(set(cves))
             elif key == "poc": out["poc"] = val
             matched = True
-
         if not matched and not line.strip().startswith("#"):
             body_start = i
             break
-
     out["body_start"] = body_start
     if not out.get("cve_list"):
         cves = [c.upper() for c in CVE_TOKEN.findall(text or "")]
@@ -163,7 +174,6 @@ def parse_raw_headers(text: str) -> dict:
     return out
 
 def parse_body_sections_from_raw(text: str, body_start: int) -> dict:
-    URL_TOKEN = re.compile(r"https?://[^\s\)\]]+")
     body = "\n".join(text.splitlines()[body_start:]).strip() if text else ""
     lines = [ln.rstrip() for ln in body.splitlines()]
     blocks, buf = [], []
@@ -214,7 +224,6 @@ def parse_body_sections_from_raw(text: str, body_start: int) -> dict:
         "links": links,
     }
 
-# ---------------------- Parsers (HTML meta) --------------
 def parse_detail_html(html: str) -> dict:
     soup = BeautifulSoup(html or "", "lxml")
     meta = {"h1_title": None, "author": None, "platform": None, "type": None,
@@ -249,39 +258,54 @@ def parse_detail_html(html: str) -> dict:
     meta["date_iso"] = parse_date_to_iso(pick("date") or pick("published"))
     return meta
 
-# ---------------------- Listing collector ----------------
-def collect_ids_from_listing(listing_url: str, pages: int = 1) -> List[int]:
-    ids: List[int] = []
-    url = listing_url
-    for _ in range(max(1, pages)):
-        html = http_get_text(url) or ""
-        if not html: break
-        soup = BeautifulSoup(html, "lxml")
-        for a in soup.find_all("a", href=True):
-            m = re.search(r"/exploits/(\d+)", a["href"])
-            if m:
-                ids.append(int(m.group(1)))
-        # NEXT
-        next_href = None
-        for a in soup.find_all("a", href=True):
-            label = (a.get_text(strip=True) or "").upper()
-            if label == "NEXT" or a.get("rel") == ["next"]:
-                next_href = a["href"]; break
-        if not next_href: break
-        if next_href.startswith("/"):
-            url = EDB_HOME.rstrip("/") + next_href
-        elif next_href.startswith("http"):
-            url = next_href
-        else:
-            url = EDB_HOME.rstrip("/") + "/" + next_href.lstrip("/")
-    # unique in order
-    seen=set(); uniq=[]
-    for i in ids:
-        if i not in seen:
-            uniq.append(i); seen.add(i)
-    return uniq
+def parse_body_sections_from_html(html: str) -> dict:
+    soup = BeautifulSoup(html or "", "lxml")
+    def para_texts(node):
+        out=[]
+        for p in node.find_all(["p","li"]):
+            if p.find_parent(["pre","code"]): continue
+            t = p.get_text(" ", strip=True)
+            if t: out.append(t)
+        return out
 
-# ---------------------- Normalization --------------------
+    overview, requirements, impact = [], [], []
+    poc_text = None
+    text_blocks = para_texts(soup)
+
+    def pull(heads):
+        for h in soup.find_all(re.compile("^h[1-6]$")):
+            lab=(h.get_text(" ", strip=True) or "").lower()
+            if any(k in lab for k in heads):
+                buf=[]
+                for sib in h.find_all_next():
+                    if sib.name and re.match(r"^h[1-6]$", sib.name): break
+                    if sib.name in ("p","li") and not sib.find_parent(["pre","code"]):
+                        t=sib.get_text(" ", strip=True)
+                        if t: buf.append(t)
+                return buf
+        return []
+    req=pull(["requirement"]); imp=pull(["impact"]); poc=pull(["poc","proof of concept","steps to reproduce"])
+    if req: requirements=req
+    if imp: impact=imp
+    if poc: poc_text="\n".join(poc)
+
+    if text_blocks:
+        for t in text_blocks:
+            if any(k in t.lower() for k in ["requirements","impact","proof of concept","steps to reproduce"]):
+                continue
+            overview.append(t)
+        if not overview and text_blocks:
+            overview=text_blocks[:3]
+    links = sorted(set(URL_TOKEN.findall(" ".join(text_blocks) if text_blocks else "")))
+    return {
+        "overview": "\n\n".join(overview).strip() if overview else None,
+        "requirements": requirements,
+        "impact": impact,
+        "poc_text": poc_text,
+        "links": links,
+    }
+
+# ---------------------- Build record / normalize ----------------------
 def normalize_record(edb_id: int, csv_row: Optional[dict], raw: dict, html_meta: dict, body: dict) -> dict:
     raw_title  = raw.get("Exploit Title")
     html_title = html_meta.get("h1_title")
@@ -354,61 +378,11 @@ def force_defaults(rec: dict) -> dict:
     if rec.get("port") is None: rec["port"] = ""
     return rec
 
-# ---------------------- HTML Body Fallback ---------------
-def parse_body_sections_from_html(html: str) -> dict:
-    soup = BeautifulSoup(html or "", "lxml")
-    def para_texts(node):
-        out=[]
-        for p in node.find_all(["p","li"]):
-            if p.find_parent(["pre","code"]): continue
-            t = p.get_text(" ", strip=True)
-            if t: out.append(t)
-        return out
-
-    overview, requirements, impact = [], [], []
-    poc_text = None
-    text_blocks = para_texts(soup)
-
-    def pull(heads):
-        for h in soup.find_all(re.compile("^h[1-6]$")):
-            lab=(h.get_text(" ", strip=True) or "").lower()
-            if any(k in lab for k in heads):
-                buf=[]
-                for sib in h.find_all_next():
-                    if sib.name and re.match(r"^h[1-6]$", sib.name): break
-                    if sib.name in ("p","li") and not sib.find_parent(["pre","code"]):
-                        t=sib.get_text(" ", strip=True)
-                        if t: buf.append(t)
-                return buf
-        return []
-    req=pull(["requirement"]); imp=pull(["impact"]); poc=pull(["poc","proof of concept","steps to reproduce"])
-    if req: requirements=req
-    if imp: impact=imp
-    if poc: poc_text="\n".join(poc)
-
-    if text_blocks:
-        for t in text_blocks:
-            if any(k in t.lower() for k in ["requirements","impact","proof of concept","steps to reproduce"]):
-                continue
-            overview.append(t)
-        if not overview and text_blocks:
-            overview=text_blocks[:3]
-    links = sorted(set(URL_TOKEN.findall(" ".join(text_blocks) if text_blocks else "")))
-    return {
-        "overview": "\n\n".join(overview).strip() if overview else None,
-        "requirements": requirements,
-        "impact": impact,
-        "poc_text": poc_text,
-        "links": links,
-    }
-
-# ---------------------- Build one record -----------------
-def build_record_for_id(edb_id: int, csv_index: Dict[int, dict]) -> dict:
+def build_record_for_id(edb_id: int, csv_index: Optional[Dict[int, dict]]) -> dict:
     raw_txt = http_get_text(EDB_RAW_FMT.format(id=edb_id))
-    if not raw_txt:
-        row = csv_index.get(edb_id)
-        if row and row.get("file"):
-            raw_txt = http_get_text(RAW_BASE_GITLAB + row["file"]) or ""
+    row = csv_index.get(edb_id) if csv_index else None
+    if not raw_txt and row and row.get("file"):
+        raw_txt = http_get_text(RAW_BASE_GITLAB + row["file"]) or ""
     parsed_raw = parse_raw_headers(raw_txt or "")
     body_raw  = parse_body_sections_from_raw(raw_txt or "", parsed_raw.get("body_start", 0))
     html = http_get_text(EDB_DETAIL_FMT.format(id=edb_id)) or ""
@@ -418,10 +392,10 @@ def build_record_for_id(edb_id: int, csv_index: Dict[int, dict]) -> dict:
         for k in ["overview","requirements","impact","poc_text","links"]:
             if not body_raw.get(k):
                 body_raw[k] = body_html.get(k)
-    rec = normalize_record(edb_id, None, parsed_raw, meta_html, body_raw)
+    rec = normalize_record(edb_id, row, parsed_raw, meta_html, body_raw)
     return force_defaults(rec)
 
-# ---------------------- Scrape orchestration -------------
+# ---------------------- Search helpers ----------------------
 def collect_ids_from_listing(listing_url: str, pages: int = 1) -> List[int]:
     ids: List[int] = []
     url = listing_url
@@ -445,21 +419,11 @@ def collect_ids_from_listing(listing_url: str, pages: int = 1) -> List[int]:
             url = next_href
         else:
             url = EDB_HOME.rstrip("/") + "/" + next_href.lstrip("/")
-    seen=set(); uniq=[]
+    seen, uniq = set(), []
     for i in ids:
         if i not in seen:
             uniq.append(i); seen.add(i)
     return uniq
-
-def scrape_ids(url: str, pages: int) -> List[int]:
-    ids = collect_ids_from_listing(url, pages=pages)
-    if ids:
-        return ids
-    wanted = max(30, pages * 30)
-    ids = latest_ids_from_csv(wanted)
-    if ids:
-        print(f"[info] Listing had 0 links. Falling back to CSV latest {len(ids)} IDs.")
-    return ids
 
 def scrape_and_store_to_json(url: str, output_filename: str = "report.json", pages: int = 1, count: int = 30):
     ids = collect_ids_from_listing(url, pages=pages)
@@ -478,7 +442,23 @@ def scrape_and_store_to_json(url: str, output_filename: str = "report.json", pag
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"✅ Wrote {len(results)} records to {output_filename}")
 
-# ---------------------- DB-only API helpers --------------
+def search_ids_for_cve_live(cve: str) -> List[int]:
+    """Try Exploit-DB search endpoints to find exploit IDs for a CVE."""
+    ids: List[int] = []
+    for url in (EDB_SEARCH_CVE.format(cve=cve), EDB_SEARCH_Q.format(q=cve)):
+        html = http_get_text(url)
+        if not html:
+            continue
+        for m in re.finditer(r"/exploits/(\d+)", html):
+            ids.append(int(m.group(1)))
+        time.sleep(0.2)
+    seen, uniq = set(), []
+    for i in ids:
+        if i not in seen:
+            uniq.append(i); seen.add(i)
+    return uniq
+
+# ---------------------- DB helpers + API -----------------
 def _load_db(db_path: str) -> List[dict]:
     try:
         with open(db_path, "r", encoding="utf-8") as f:
@@ -487,8 +467,7 @@ def _load_db(db_path: str) -> List[dict]:
     except FileNotFoundError:
         return []
 
-def records_for_cve_db_only(cve_id: str, db_path: str) -> List[dict]:
-    """Return all FULL records for CVE from DB only (no live fallback)."""
+def _records_for_cve_in_db(cve_id: str, db_path: str) -> List[dict]:
     want = (cve_id or "").strip().upper()
     if not want:
         return []
@@ -499,32 +478,191 @@ def records_for_cve_db_only(cve_id: str, db_path: str) -> List[dict]:
             recs.append(r)
     return recs
 
+def API(cve_id: str, date_iso: Optional[str] = None,
+        db_path: str = DEFAULT_DB_PATH,
+        live_fallback: bool = True) -> Optional[List[dict]]:
+    """
+    API('CVE-2025-12345', '2025-07-08'):
+      1) Look up CVE in local DB; if date provided, require published_date_iso match.
+      2) If not found and live_fallback=True, search Exploit-DB live and return full records.
+      Returns list of full records on success; None if no match.
+    """
+    want = (cve_id or "").strip().upper()
+    if not want:
+        return None
+
+    # 1) DB lookup
+    recs = _records_for_cve_in_db(want, db_path)
+    if date_iso:
+        date_iso = parse_date_to_iso(date_iso) or date_iso
+        recs = [r for r in recs if (r.get("published_date_iso") or "") == (date_iso or "")]
+    if recs:
+        return recs
+
+    # 2) Live fallback
+    if not live_fallback:
+        return None
+
+    ids = search_ids_for_cve_live(want)
+    if not ids:
+        return None
+
+    csv_index = load_csv_index()
+    out: List[dict] = []
+    for edb_id in ids:
+        rec = build_record_for_id(edb_id, csv_index)
+        cves_upper = [c.upper() for c in (rec.get("cve") or [])]
+        if want not in cves_upper:
+            continue
+        if date_iso:
+            d = rec.get("published_date_iso") or ""
+            if (parse_date_to_iso(d) or d) != date_iso:
+                continue
+        out.append(rec)
+        time.sleep(DELAY)
+    return out or None
+
+# ---------------------- Fill to at least N CVE records -----------------
+def fetch_latest_cve_records(min_needed: int,
+                             exclude_ids: Optional[set] = None,
+                             exclude_cves: Optional[set] = None) -> List[dict]:
+    """
+    Pull recent Exploit-DB items (via CSV index), build full records,
+    and return those that have at least one CVE. Skips IDs/CVEs in exclude sets.
+    """
+    exclude_ids = exclude_ids or set()
+    exclude_cves = set([c.upper() for c in (exclude_cves or set())])
+
+    # Grab a generous slice of latest IDs so we can filter to those with CVEs
+    ids = latest_ids_from_csv(max(300, min_needed * 15))
+    csv_index = load_csv_index()
+    out: List[dict] = []
+
+    for edb_id in ids:
+        if edb_id in exclude_ids:
+            continue
+        rec = build_record_for_id(edb_id, csv_index)
+        cves = [c.upper() for c in (rec.get("cve") or [])]
+        if not cves:
+            continue
+        if exclude_cves and all(c in exclude_cves for c in cves):
+            # All CVEs are already represented; skip
+            continue
+        out.append(rec)
+        exclude_ids.add(edb_id)
+        for c in cves:
+            exclude_cves.add(c)
+        if len(out) >= min_needed:
+            break
+        time.sleep(DELAY)
+    return out
+
+# ---------------------- No-arg default runner ------------
+def _parse_cve_line(line: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Accepts:
+      CVE-YYYY-NNNN
+      CVE-YYYY-NNNN,YYYY-MM-DD
+    Returns (cve, date_or_None) or (None, None).
+    """
+    if not line.strip():
+        return (None, None)
+    upper = line.strip().upper()
+    cve_m = CVE_TOKEN.search(upper)
+    if not cve_m:
+        return (None, None)
+    cve = cve_m.group(0)
+    parts = [p.strip() for p in line.split(",")]
+    date_iso = parse_date_to_iso(parts[1]) if len(parts) > 1 and parts[1] else None
+    return (cve, date_iso)
+
+def _load_cve_queries_from_file(path: str) -> List[Tuple[str, Optional[str]]]:
+    import pathlib
+    p = pathlib.Path(path)
+    if not p.exists():
+        return []
+    out: List[Tuple[str, Optional[str]]] = []
+    for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
+        cve, date_iso = _parse_cve_line(raw)
+        if cve:
+            out.append((cve, date_iso))
+    return out
+
+def _fallback_queries() -> List[Tuple[str, Optional[str]]]:
+    out: List[Tuple[str, Optional[str]]] = []
+    for raw in CVE_FALLBACK_LINES:
+        cve, date_iso = _parse_cve_line(raw)
+        if cve:
+            out.append((cve, date_iso))
+    return out
+
+def default_run(db_path: str = DEFAULT_DB_PATH, cve_list_path: str = DEFAULT_CVE_LIST) -> int:
+    """
+    Run with no args:
+      - Read CVEs from cves.txt (or fallback list)
+      - For each CVE[,date], print full JSON record(s) if found (DB or live), else print 'null'
+      - Then top up with the latest Exploit-DB CVE-backed records until at least MIN_DEFAULT_RESULTS are printed
+    """
+    queries = _load_cve_queries_from_file(cve_list_path)
+    if not queries:
+        queries = _fallback_queries()
+
+    printed_count = 0
+    seen_ids: set = set()
+    seen_cves: set = set()
+
+    # 1) Process requested CVEs first
+    for cve, date_iso in queries:
+        recs = API(cve, date_iso, db_path=db_path, live_fallback=True)
+        if not recs:
+            print("null")
+            printed_count += 1
+            continue
+        # print all records for that CVE (dedup by id)
+        for r in recs:
+            rid = int(r.get("id") or 0) if (r.get("id") and str(r.get("id")).isdigit()) else r.get("id")
+            if rid in seen_ids:
+                continue
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+            printed_count += 1
+            seen_ids.add(rid)
+            for c in (r.get("cve") or []):
+                seen_cves.add(c.upper())
+
+    # 2) If we haven't printed at least MIN_DEFAULT_RESULTS items, top up with latest CVE-backed exploits
+    if printed_count < MIN_DEFAULT_RESULTS:
+        need = MIN_DEFAULT_RESULTS - printed_count
+        fillers = fetch_latest_cve_records(need, exclude_ids=seen_ids, exclude_cves=seen_cves)
+        for r in fillers:
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+        printed_count += len(fillers)
+
+    return 0
+
 # ---------------------- CLI ------------------------------
 if __name__ == "__main__":
-    import argparse, sys, pathlib
+    import argparse, sys
+    if len(sys.argv) == 1:
+        sys.exit(default_run())
 
     ap = argparse.ArgumentParser(
         description="Exploit-DB → JSON with exact 'Exploit Title'/'Exploit Author' keys + full details"
     )
     sub = ap.add_subparsers(dest="cmd")
 
-    # scrape subcommand
+    # scrape subcommand (optional: build your local DB)
     scrape = sub.add_parser("scrape", help="Scrape listing/CSV and write JSON DB")
     scrape.add_argument("--url", type=str, default=EDB_HOME, help="Listing URL (default: Exploit-DB home)")
     scrape.add_argument("--pages", type=int, default=1, help="How many listing pages to traverse")
     scrape.add_argument("--count", type=int, default=30, help="How many items to fetch if listing empty (CSV fallback)")
-    scrape.add_argument("--out", type=str, default="report.json", help="Output JSON file")
+    scrape.add_argument("--out", type=str, default=DEFAULT_DB_PATH, help="Output JSON file")
 
-    # api (single CVE, DB-only)
-    api = sub.add_parser("api", help="DB-only: print FULL record(s) for one CVE, or null if not found")
+    # api subcommand (single CVE, optional date; DB + live fallback)
+    api = sub.add_parser("api", help="Lookup CVE (DB first, then live search); prints full records or null")
     api.add_argument("--cve", required=True, type=str, help="CVE ID (e.g., CVE-2025-26264)")
-    api.add_argument("--db", type=str, default="report.json", help="Path to JSON DB")
-
-    # batch (multiple CVEs, DB-only)
-    batch = sub.add_parser("batch", help="DB-only: check many CVEs; print result per CVE; print null if missing")
-    batch.add_argument("--db", type=str, default="report.json", help="Path to JSON DB")
-    batch.add_argument("--cves", nargs="*", help="Space-separated CVEs (e.g., CVE-2025-26264 CVE-2025-12345)")
-    batch.add_argument("--file", type=str, help="File with CVEs (any text; CVE- patterns will be extracted)")
+    api.add_argument("--date", type=str, help="Optional ISO date (YYYY-MM-DD)")
+    api.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="Path to JSON DB")
+    api.add_argument("--no-live", action="store_true", help="Disable live fallback (DB only)")
 
     args = ap.parse_args()
 
@@ -533,7 +671,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     if args.cmd == "api":
-        recs = records_for_cve_db_only(args.cve, args.db)
+        recs = API(args.cve, args.date, db_path=args.db, live_fallback=not args.no_live)
         if not recs:
             print("null")
         elif len(recs) == 1:
@@ -542,40 +680,5 @@ if __name__ == "__main__":
             print(json.dumps(recs, ensure_ascii=False, indent=2))
         sys.exit(0)
 
-    if args.cmd == "batch":
-        # Collect CVEs from args/file; extract CVE-XXXX-XXXXX tokens
-        cves_in = set()
-        if args.cves:
-            for c in args.cves:
-                m = CVE_TOKEN.search(c.upper())
-                if m: cves_in.add(m.group(0))
-        if args.file:
-            p = pathlib.Path(args.file)
-            if p.exists():
-                text = p.read_text(encoding="utf-8", errors="ignore")
-                for m in CVE_TOKEN.finditer(text.upper()):
-                    cves_in.add(m.group(0))
-
-        if not cves_in:
-            print("[]")
-            sys.exit(0)
-
-        # Keep stable order: sort by year then id numeric
-        def _key(cve: str):
-            y, n = cve.split("-")[1], cve.split("-")[2]
-            return (int(y), int(n))
-        ordered = sorted(cves_in, key=_key)
-
-        for cve in ordered:
-            recs = records_for_cve_db_only(cve, args.db)
-            if not recs:
-                print("null")
-            elif len(recs) == 1:
-                print(json.dumps(recs[0], ensure_ascii=False, indent=2))
-            else:
-                print(json.dumps(recs, ensure_ascii=False, indent=2))
-        sys.exit(0)
-
-    # Default (no subcommand): quick help
     ap.print_help()
     sys.exit(1)
